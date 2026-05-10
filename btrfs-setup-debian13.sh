@@ -4,6 +4,7 @@
 # No mkfs/format/wipe paths — verifies TYPE=btrfs before any destructive operation.
 #
 # apt install btrfs-progs util-linux coreutils mount e2fsprogs
+#   For ensure-full-stack also: grub-common grub-pc OR grub-efi, initramfs-tools
 #
 # Examples:
 #   sudo ./btrfs-setup-debian13.sh ensure \
@@ -22,6 +23,12 @@
 #
 # Discover current root disk, ensure @ /@home /@var /@log then mount (/ /home /var /var/log):
 #   sudo ./btrfs-setup-debian13.sh ensure-os-layout --write-fstab --ssd-auto
+#
+# Detect firmware (EFI vs BIOS) and print matching grub-install hints:
+#   ./btrfs-setup-debian13.sh detect-boot
+#
+# Btrfs @ /@home/@var/@log plus ext4 /boot (and ESP on UEFI): layout, fstab, grub cmdline, initramfs, grub-install:
+#   sudo ./btrfs-setup-debian13.sh ensure-full-stack --ssd-auto
 #
 set -euo pipefail
 
@@ -46,7 +53,10 @@ MOUNTPOINT=""
 MOUNT_OPTIONS=""
 MOUNT_SUBVOL="" # btrfs option subvol=name (omit = filesystem default subvolume)
 ENSURE_SUBVOLUMES_RAW="" # comma-separated top-level subvolume names
-SOURCE_CMD="ensure" # ensure|ensure-os-layout|status|ensure-mount|ensure-subvolumes|ensure-fstab
+SKIP_BOOTLOADER_STACK=0 # ensure-full-stack: omit grub.d snippet, initramfs, update-grub, grub-install
+SOURCE_CMD="ensure" # ensure|ensure-os-layout|ensure-full-stack|status|ensure-mount|ensure-subvolumes|ensure-fstab|detect-boot
+
+readonly GRUB_SUBVOL_SNIPPET=/etc/default/grub.d/50-btrfs-setup-debian13-rootflags.cfg
 
 STAGING_MOUNT="" # allocated in ensure_* with cleanup trap
 
@@ -81,7 +91,10 @@ validate_cross_command_flags_or_die() {
   local cmd="$1"
 
   case "${cmd}" in
-    ensure-os-layout)
+    detect-boot)
+      return 0
+      ;;
+    ensure-os-layout|ensure-full-stack)
       if [[ "${STRICT_MOUNTPOINT_LAYOUT}" -eq 1 ]]; then
         OS_ACCEPT_NONEMPTY=0
       fi
@@ -91,12 +104,24 @@ validate_cross_command_flags_or_die() {
       ;;
   esac
 
-  [[ -z "${LAYOUT_SPEC_RAW}" ]] || die "--layout is only valid with ensure-os-layout"
-  [[ "${SSD_AUTO}" -eq 1 ]] && die "--ssd-auto is only valid with ensure-os-layout"
-  [[ "${RELAX_ROOT_MOUNT_VERIFY}" -eq 1 ]] && die "--relax-root-mount-verify is only valid with ensure-os-layout"
-  [[ "${STRICT_MOUNTPOINT_LAYOUT}" -eq 1 ]] && die "--strict-empty-mountpoints is only valid with ensure-os-layout"
-  [[ "${SKIP_NOCOW_VARLOG_LAYOUT}" -eq 1 ]] && [[ "${cmd}" != ensure-os-layout ]] \
-    && die "--skip-nocow-var-log is only supported with ensure-os-layout"
+  [[ "${SKIP_BOOTLOADER_STACK}" -eq 1 ]] && [[ "${cmd}" != ensure-full-stack ]] \
+    && die "--skip-bootloader is only valid with ensure-full-stack"
+
+  [[ -z "${LAYOUT_SPEC_RAW}" ]] \
+    || [[ "${cmd}" == ensure-os-layout || "${cmd}" == ensure-full-stack ]] \
+    || die "--layout is only valid with ensure-os-layout or ensure-full-stack"
+  [[ "${SSD_AUTO}" -eq 1 ]] \
+    && [[ "${cmd}" != ensure-os-layout && "${cmd}" != ensure-full-stack ]] \
+    && die "--ssd-auto is only valid with ensure-os-layout or ensure-full-stack"
+  [[ "${RELAX_ROOT_MOUNT_VERIFY}" -eq 1 ]] \
+    && [[ "${cmd}" != ensure-os-layout && "${cmd}" != ensure-full-stack ]] \
+    && die "--relax-root-mount-verify is only valid with ensure-os-layout or ensure-full-stack"
+  [[ "${STRICT_MOUNTPOINT_LAYOUT}" -eq 1 ]] \
+    && [[ "${cmd}" != ensure-os-layout && "${cmd}" != ensure-full-stack ]] \
+    && die "--strict-empty-mountpoints is only valid with ensure-os-layout or ensure-full-stack"
+  [[ "${SKIP_NOCOW_VARLOG_LAYOUT}" -eq 1 ]] \
+    && [[ "${cmd}" != ensure-os-layout && "${cmd}" != ensure-full-stack ]] \
+    && die "--skip-nocow-var-log is only supported with ensure-os-layout or ensure-full-stack"
   [[ "${SKIP_NOCOW_VARLOG_LAYOUT}" -eq 1 ]] && [[ "${NOCOW_VARLOG_CLI}" -eq 1 ]] \
     && die "use only one of --nocow-var-log / --skip-nocow-var-log"
   [[ "${NOCOW_VARLOG_CLI}" -eq 1 ]] && [[ "${cmd}" != ensure && "${cmd}" != ensure-subvolumes ]] \
@@ -114,6 +139,8 @@ Commands:
   ensure-mount        Ensure mountpoint is mounted correctly (requires --uuid or --device)
   ensure-subvolumes   Ensure top-level subvolumes exist (staging mount at fs root)
   ensure-fstab        Ensure /etc/fstab has a compatible line for this UUID + mountpoint
+  ensure-full-stack   ensure-os-layout (always writes btrfs fstab) + ext4 /boot [/boot/efi] + grub + initramfs
+  detect-boot         Print whether this session booted via UEFI or legacy BIOS + grub-install hints
 
 Options:
   --uuid UUID              Filesystem UUID (no UUID= prefix)
@@ -131,7 +158,8 @@ Options:
   --relax-root-mount-verify   Do not insist / matches subvol=@ + derived options exactly
   --accept-nonempty-mounts    ensure-mount: allow masking a non-empty mount directory (risky)
   --nocow-var-log             After @var,@log subs exist or are created set chattr +C (ensure / ensure-subvolumes)
-  --skip-nocow-var-log        ensure-os-layout only: skip chattr +C on @var and @log (keep default btrfs CoW)
+  --skip-nocow-var-log        ensure-os-layout / ensure-full-stack: skip chattr +C on @var and @log
+  --skip-bootloader           ensure-full-stack only: btrfs layout + fstab only (no grub.d / initramfs / grub-install)
 
 ensure-os-layout:
   Defaults --layout to '${DEFAULT_OS_LAYOUT_RAW}' (mount order respects / before /home /var before /var/log).
@@ -139,6 +167,18 @@ ensure-os-layout:
   By default applies chattr +C on '@var' and '@log' tops (nocow/new data avoids CoW, better for databases/logs).
   Only names '@var' and '@log' receive +C; customise mount names in --layout → set +C yourself if needed.
   By default allows non-empty /home,/var,/var/log overlays; use --strict-empty-mountpoints to refuse instead.
+
+ensure-full-stack:
+  Requires '/' btrfs, separate '/boot' ext3/ext4 (kernels not on btrfs). If this session booted with UEFI,
+  '/boot/efi' must be mounted vfat.
+  Runs the default layout (@, @home, @var, @log), appends btrfs + /boot (+ ESP) fstab lines, writes
+  ${GRUB_SUBVOL_SNIPPET} so GRUB_CMDLINE_LINUX gains rootflags=subvol=@,... from live '/', then
+  update-initramfs -u -k all, update-grub, and grub-install (EFI vs BIOS detected like detect-boot).
+
+detect-boot:
+  Reports BOOT_FIRMWARE=uefi|bios from the running kernel (/sys/firmware/efi).
+  Prints example grub-install for separate /boot: UEFI uses --efi-directory=/boot/efi; BIOS uses the whole disk
+  hosting /boot (or / if /boot is not a mountpoint). Does not modify the system.
 
 Defaults for --mount-options when omitted:
   defaults,noatime,compress=zstd:3[,ssd,discard=async if --ssd]
@@ -447,6 +487,100 @@ fstab_append_idempotent_or_die() {
   log "fstab appended: ${line}"
 }
 
+_fstab_pick_generic_record_fields_or_die() {
+  local mnt="$1" want_src="$2" want_fstype="$3" want_opts_full="$4"
+  [[ -f /etc/fstab ]] || die "/etc/fstab missing"
+
+  local -a lines
+  mapfile -t lines < <(awk -v m="$mnt" '!/^#/ && NF >= 6 && $2 == m {
+      print $1 "\t" $3 "\t" $4
+    }' /etc/fstab)
+
+  [[ "${#lines[@]}" -eq 0 ]] && return 2
+  [[ "${#lines[@]}" -eq 1 ]] \
+    || die "fstab: multiple entries declare mountpoint '${mnt}' — fix manually (${#lines[@]} hits)"
+
+  IFS=$'\t' read -r fstab_src fstype fstab_opts <<<"${lines[0]}"
+  [[ -n "${fstab_src}" && -n "${fstype}" && -n "${fstab_opts}" ]] \
+    || die "fstab: failed to parse existing line for '${mnt}'"
+
+  [[ "${fstype}" == "${want_fstype}" ]] \
+    || die "fstab: ${mnt} is type '${fstype}' in fstab — expected '${want_fstype}'"
+
+  [[ "${fstab_src}" == "${want_src}" ]] \
+    || die "fstab: ${mnt} uses source '${fstab_src}', wanted '${want_src}'"
+
+  local wanted_n got_n
+  wanted_n="$(normalize_mount_opts_list "${want_opts_full}")"
+  got_n="$(normalize_mount_opts_list "${fstab_opts}")"
+
+  [[ "${got_n}" == "${wanted_n}" ]] \
+    || die "fstab: ${mnt} options differ from desired (normalized compare)
+  fstab: ${fstab_opts}
+  wanted: ${want_opts_full}"
+
+  return 0
+}
+
+_fstab_generic_conflict_resolved_or_die() {
+  local uuid_lc="$1" mnt="$2" fstype="$3" want_opts="$4"
+  local want_src="UUID=${uuid_lc}"
+
+  if _fstab_pick_generic_record_fields_or_die "${mnt}" "${want_src}" "${fstype}" "${want_opts}"; then
+    return 0
+  fi
+  local rc=$?
+  [[ "${rc}" -eq 2 ]] && return 0
+  die "_fstab_generic_conflict_resolved_or_die: unexpected rc=${rc}"
+}
+
+fstab_generic_already_ok() {
+  local uuid_lc="$1" mnt="$2" fstype="$3" want_opts="$4"
+  local want_src="UUID=${uuid_lc}"
+  if _fstab_pick_generic_record_fields_or_die "${mnt}" "${want_src}" "${fstype}" "${want_opts}"; then
+    return 0
+  fi
+  local rc=$?
+  [[ "${rc}" -eq 2 ]] && return 1
+  die "fstab_generic_already_ok: unexpected rc=${rc}"
+}
+
+fstab_append_generic_idempotent_or_die() {
+  local uuid_lc="$1" mnt="$2" fstype="$3" opts="$4" dump_pass="$5" fsck_pass="$6"
+  uuid_lc="$(lc_uuid "${uuid_lc}")"
+
+  fstab_generic_already_ok "${uuid_lc}" "${mnt}" "${fstype}" "${opts}" \
+    && { log "fstab entry already satisfies ${mnt}"; return 0; }
+
+  _fstab_generic_conflict_resolved_or_die "${uuid_lc}" "${mnt}" "${fstype}" "${opts}"
+
+  local line="UUID=${uuid_lc} ${mnt} ${fstype} ${opts} ${dump_pass} ${fsck_pass}"
+  local bak="/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    run cp -a /etc/fstab "${bak}"
+    log "would append to /etc/fstab:"
+    printf '%s\n' "${line}"
+    return 0
+  fi
+
+  cp -a /etc/fstab "${bak}"
+  log "fstab backed up to ${bak}"
+  printf '%s\n' "${line}" >> /etc/fstab
+  log "fstab appended: ${line}"
+}
+
+fstab_sync_live_mount_or_die() {
+  local mp="$1" dump_pass="$2" fsck_pass="$3"
+  local uuid fst opts
+  uuid="$(findmnt -n -o UUID "${mp}" 2>/dev/null || true)"
+  fst="$(findmnt -n -o FSTYPE "${mp}" 2>/dev/null || true)"
+  opts="$(findmnt -n -o OPTIONS "${mp}" 2>/dev/null || true)"
+  [[ -n "${uuid}" && -n "${fst}" ]] || die "${mp}: cannot read UUID/FSTYPE from findmnt"
+  opts="$(normalize_mount_opts_list "${opts}")"
+  fstab_append_generic_idempotent_or_die "${uuid}" "${mp}" "${fst}" "${opts}" "${dump_pass}" "${fsck_pass}"
+}
+
 verify_mount_correct_or_die() {
   local uuid="$1" mp="$2" want_opts_full="$3"
 
@@ -720,10 +854,7 @@ handle_full_ensure_cmd() {
   fi
 }
 
-handle_ensure_os_layout_cmd() {
-  need_root
-  ensure_deps_rw
-
+ensure_os_layout_execute_or_die() {
   local uuid dev resolved stripped base_eff Lay src_live sub mp opts accept_nl fst_t cid
 
   if [[ -n "${UUID}" || -n "${DEVICE}" ]]; then
@@ -796,6 +927,12 @@ handle_ensure_os_layout_cmd() {
   done
 }
 
+handle_ensure_os_layout_cmd() {
+  need_root
+  ensure_deps_rw
+  ensure_os_layout_execute_or_die
+}
+
 status_cmd_mount_from_uuid() {
   local uuid="$1" mp=""
   mp="$(findmnt -S "$(mount_source_spec "${uuid}")" -n -o TARGET 2>/dev/null | head -n1)" || mp=""
@@ -848,6 +985,206 @@ handle_status_cmd() {
   die "status needs --mountpoint or --uuid/--device"
 }
 
+# Strip optional btrfs subvol suffix from findmnt SOURCE, e.g. /dev/nvme0n1p2[/@] -> /dev/nvme0n1p2
+strip_findmnt_source_suffix() {
+  printf '%s' "$1" | sed 's/\[[^]]*\]$//'
+}
+
+resolve_mount_source_to_block_or_die() {
+  local raw="$1" part=""
+  raw="$(strip_findmnt_source_suffix "${raw}")"
+
+  if [[ "${raw}" == UUID=* ]]; then
+    part="$(blkid -U "$(lc_uuid "${raw#UUID=}")" 2>/dev/null || true)"
+  elif [[ "${raw}" == PARTUUID=* ]]; then
+    part="$(blkid -t "PARTUUID=${raw#PARTUUID=}" -o device 2>/dev/null | head -n1)"
+  elif [[ "${raw}" == LABEL=* ]]; then
+    part="$(blkid -L "${raw#LABEL=}" 2>/dev/null || true)"
+  else
+    part="$(readlink -f "${raw}" 2>/dev/null || true)"
+  fi
+
+  [[ -n "${part}" && -b "${part}" ]] || die "cannot resolve block device from mount source '${1}'"
+  printf '%s\n' "${part}"
+}
+
+whole_disk_for_partition_or_die() {
+  local part="$1" disk=""
+  disk="$(lsblk -ndo PKNAME -p "${part}" 2>/dev/null || true)"
+  [[ -n "${disk}" && -b "${disk}" ]] \
+    || die "cannot derive whole-disk device from partition ${part} (lsblk PKNAME)"
+  printf '%s\n' "${disk}"
+}
+
+detect_boot_firmware() {
+  if [[ -d /sys/firmware/efi ]]; then
+    printf 'uefi\n'
+  else
+    printf 'bios\n'
+  fi
+}
+
+grub_efi_target_from_uname() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'x86_64-efi\n' ;;
+    aarch64|arm64) printf 'arm64-efi\n' ;;
+    i386|i686) printf 'i386-efi\n' ;;
+    *) printf 'x86_64-efi\n' ;; # best-effort default
+  esac
+}
+
+run_grub_install_for_current_boot_or_die() {
+  local firmware efi_tgt mp src part disk
+  firmware="$(detect_boot_firmware)"
+  efi_tgt="$(grub_efi_target_from_uname)"
+  case "${firmware}" in
+    uefi)
+      findmnt /boot/efi >/dev/null 2>&1 || die "grub-install: /boot/efi not mounted (UEFI)"
+      log "grub-install: UEFI --target=${efi_tgt}"
+      run grub-install --target="${efi_tgt}" --efi-directory=/boot/efi --boot-directory=/boot
+      ;;
+    bios)
+      mp="/boot"
+      findmnt "${mp}" >/dev/null 2>&1 || mp="/"
+      src="$(findmnt -n -o SOURCE "${mp}" 2>/dev/null || true)"
+      [[ -n "${src}" ]] || die "grub-install: cannot read findmnt SOURCE for ${mp}"
+      part="$(resolve_mount_source_to_block_or_die "${src}")"
+      disk="$(whole_disk_for_partition_or_die "${part}")"
+      log "grub-install: BIOS disk ${disk}"
+      run grub-install --target=i386-pc --boot-directory=/boot "${disk}"
+      ;;
+  esac
+}
+
+verify_full_stack_mount_topology_or_die() {
+  local rootfst bootfst effst
+  rootfst="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+  [[ "${rootfst}" == btrfs ]] \
+    || die "ensure-full-stack: '/' must be btrfs (got '${rootfst}')"
+
+  findmnt /boot >/dev/null 2>&1 || die "ensure-full-stack: /boot must be mounted"
+  bootfst="$(findmnt -n -o FSTYPE /boot)"
+  case "${bootfst}" in
+    ext3|ext4) ;;
+    *) die "ensure-full-stack: /boot must be ext3/ext4 (got '${bootfst}'); keep kernels off btrfs" ;;
+  esac
+
+  if [[ "$(detect_boot_firmware)" == uefi ]]; then
+    findmnt /boot/efi >/dev/null 2>&1 \
+      || die "ensure-full-stack: UEFI session requires /boot/efi mounted (vfat ESP)"
+    effst="$(findmnt -n -o FSTYPE /boot/efi)"
+    [[ "${effst}" == vfat ]] \
+      || die "ensure-full-stack: /boot/efi must be vfat (got '${effst}')"
+  fi
+}
+
+ensure_grub_d_is_sourced_or_die() {
+  [[ -f /etc/default/grub ]] || die "/etc/default/grub missing"
+  grep -q '/etc/default/grub\.d' /etc/default/grub \
+    || die "/etc/default/grub must source /etc/default/grub.d/*.cfg (standard Debian grub-common pattern)"
+}
+
+write_grub_subvol_snippet_or_die() {
+  ensure_grub_d_is_sourced_or_die
+  local content
+  content='# Managed by btrfs-setup-debian13.sh (ensure-full-stack)
+# Append rootflags=subvol=@,... from live / when not already in GRUB_CMDLINE_LINUX
+if ! echo " ${GRUB_CMDLINE_LINUX} " | grep -qE "(^|[[:space:]])(rootflags=.*subvol=@|subvol=@)(,|$|[[:space:]])"; then
+  _bt_rf="$(findmnt -n -o OPTIONS / 2>/dev/null | tr "," "\n" | grep -Ev "^(subvol|subvolid)=" | sed "/^$/d" | paste -sd, -)"
+  [ -z "${_bt_rf}" ] && _bt_rf="defaults"
+  GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} rootflags=subvol=@,${_bt_rf}"
+fi
+'
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "would write ${GRUB_SUBVOL_SNIPPET}:"
+    printf '%s\n' "${content}"
+    return 0
+  fi
+  mkdir -p /etc/default/grub.d
+  printf '%s\n' "${content}" > "${GRUB_SUBVOL_SNIPPET}"
+  log "wrote ${GRUB_SUBVOL_SNIPPET}"
+}
+
+handle_ensure_full_stack_cmd() {
+  need_root
+  ensure_deps_rw
+  verify_full_stack_mount_topology_or_die
+
+  [[ "${DRY_RUN}" -eq 1 ]] \
+    && log "dry-run: btrfs mounts/subvolumes may be skipped (see ensure + dry-run behaviour)"
+
+  local prev_write
+  prev_write="${WRITE_FSTAB}"
+  WRITE_FSTAB=1
+  ensure_os_layout_execute_or_die
+  WRITE_FSTAB="${prev_write}"
+
+  log "fstab: sync /boot"
+  fstab_sync_live_mount_or_die /boot 0 2
+
+  if [[ "$(detect_boot_firmware)" == uefi ]]; then
+    log "fstab: sync /boot/efi"
+    fstab_sync_live_mount_or_die /boot/efi 0 1
+  fi
+
+  if [[ "${SKIP_BOOTLOADER_STACK}" -eq 1 ]]; then
+    log "skip bootloader steps (--skip-bootloader)"
+    return 0
+  fi
+
+  write_grub_subvol_snippet_or_die
+
+  have update-initramfs || die "install initramfs-tools (update-initramfs)"
+  have update-grub || die "install grub-common (update-grub)"
+  have grub-install || die "install grub-pc or grub-efi (grub-install)"
+
+  log "running update-initramfs -u -k all"
+  run update-initramfs -u -k all
+
+  log "running update-grub"
+  run update-grub
+
+  log "running grub-install"
+  run_grub_install_for_current_boot_or_die
+
+  log "ensure-full-stack: finished (reboot to verify boot)"
+}
+
+handle_detect_boot_cmd() {
+  have findmnt || die "install util-linux (findmnt)"
+  have lsblk || die "install util-linux (lsblk)"
+  have blkid || die "install util-linux (blkid)"
+
+  local firmware efi_tgt mp src part disk
+  firmware="$(detect_boot_firmware)"
+  efi_tgt="$(grub_efi_target_from_uname)"
+
+  printf 'BOOT_FIRMWARE=%s\n' "${firmware}"
+  case "${firmware}" in
+    uefi)
+      printf 'GRUB_EFI_TARGET=%s\n' "${efi_tgt}"
+      echo
+      echo "This session was started by UEFI (kernel exposes firmware under /sys/firmware/efi)."
+      echo "Example (separate /boot + ESP at /boot/efi):"
+      printf '  sudo grub-install --target=%s --efi-directory=/boot/efi --boot-directory=/boot\n' "${efi_tgt}"
+      ;;
+    bios)
+      echo
+      echo "This session was started in legacy BIOS mode (/sys/firmware/efi absent)."
+      mp="/boot"
+      findmnt "${mp}" >/dev/null 2>&1 || mp="/"
+      src="$(findmnt -n -o SOURCE "${mp}" 2>/dev/null || true)"
+      [[ -n "${src}" ]] || die "cannot read findmnt SOURCE for ${mp}"
+      part="$(resolve_mount_source_to_block_or_die "${src}")"
+      disk="$(whole_disk_for_partition_or_die "${part}")"
+      printf 'GRUB_BIOS_DISK=%s\n' "${disk}"
+      echo
+      echo "Example (kernels on /boot, GRUB core to MBR/GPT BIOS boot partition on this disk):"
+      printf '  sudo grub-install --target=i386-pc --boot-directory=/boot %q\n' "${disk}"
+      ;;
+  esac
+}
+
 main() {
   [[ "$#" -ge 1 ]] || { usage; exit 1; }
   SOURCE_CMD="$1"
@@ -869,6 +1206,7 @@ main() {
       --accept-nonempty-mounts) ACCEPT_NONNULL_MOUNTS_CLI=1; shift ;;
       --nocow-var-log) NOCOW_VARLOG_CLI=1; shift ;;
       --skip-nocow-var-log) SKIP_NOCOW_VARLOG_LAYOUT=1; shift ;;
+      --skip-bootloader) SKIP_BOOTLOADER_STACK=1; shift ;;
       --write-fstab) WRITE_FSTAB=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -881,10 +1219,12 @@ main() {
   case "${SOURCE_CMD}" in
     ensure) handle_full_ensure_cmd ;;
     ensure-os-layout) handle_ensure_os_layout_cmd ;;
+    ensure-full-stack) handle_ensure_full_stack_cmd ;;
     ensure-mount) handle_ensure_mount_cmd ;;
     ensure-subvolumes) handle_subvol_cmd ;;
     ensure-fstab) handle_fstab_only_cmd ;;
     status) handle_status_cmd ;;
+    detect-boot) handle_detect_boot_cmd ;;
     *)
       usage
       die "unknown command: ${SOURCE_CMD}"
