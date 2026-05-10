@@ -219,6 +219,17 @@ normalize_mount_opts_list() {
     | paste -sd, -
 }
 
+# Options the kernel lists but that are redundant or irrelevant when comparing our fstab/remount
+# string to findmnt(8) output (avoids false "mismatch" on /).
+canonicalize_btrfs_opts_for_compare() {
+  printf '%s' "$1" | tr ',' '\n' \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' \
+    | grep -Ev '^(seclabel|rw|defaults)$' \
+    | grep -Ev '^subvolid=' \
+    | LC_ALL=C sort \
+    | paste -sd, -
+}
+
 default_mount_opts() {
   local mo="defaults,noatime,compress=zstd:3"
   [[ "${SSD}" -eq 1 ]] && mo+=",ssd,discard=async"
@@ -581,29 +592,40 @@ fstab_sync_live_mount_or_die() {
   fstab_append_generic_idempotent_or_die "${uuid}" "${mp}" "${fst}" "${opts}" "${dump_pass}" "${fsck_pass}"
 }
 
-verify_mount_correct_or_die() {
-  local uuid="$1" mp="$2" want_opts_full="$3"
-
-  local cur_fst cur_uid cur_uid_lc cur_opts got wanted
+verify_btrfs_mount_uuid_or_die() {
+  local uuid="$1" mp="$2"
+  local cur_fst cur_uid cur_uid_lc
 
   cur_fst="$(findmnt -n -o FSTYPE "${mp}" 2>/dev/null || true)"
   [[ -n "${cur_fst}" ]] || die "${mp}: not mounted (expected btrfs)"
-
   [[ "${cur_fst}" == btrfs ]] || die "${mp}: mounted as ${cur_fst}"
 
   cur_uid="$(findmnt -n -o UUID "${mp}" || true)"
   [[ -z "${cur_uid}" ]] && die "${mp}: findmnt UUID empty"
-
   cur_uid_lc="$(lc_uuid "${cur_uid}")"
-
   [[ "${cur_uid_lc}" == "${uuid}" ]] \
     || die "${mp}: btrfs UUID mismatch (mounted ${cur_uid_lc}, wanted ${uuid})"
+}
 
+btrfs_mount_options_match_p() {
+  local mp="$1" want_opts_full="$2"
+  local cur_opts got want
+  cur_opts="$(findmnt -n -o OPTIONS "${mp}" 2>/dev/null || true)"
+  [[ -n "${cur_opts}" ]] || return 1
+  got="$(canonicalize_btrfs_opts_for_compare "${cur_opts}")"
+  want="$(canonicalize_btrfs_opts_for_compare "${want_opts_full}")"
+  [[ "${got}" == "${want}" ]]
+}
+
+verify_mount_correct_or_die() {
+  local uuid="$1" mp="$2" want_opts_full="$3"
+
+  verify_btrfs_mount_uuid_or_die "${uuid}" "${mp}"
+
+  local cur_opts got wanted
   cur_opts="$(findmnt -n -o OPTIONS "${mp}" || die "${mp}: findmnt OPTIONS empty")"
-
-  local got wanted
-  got="$(normalize_mount_opts_list "${cur_opts}")"
-  wanted="$(normalize_mount_opts_list "${want_opts_full}")"
+  got="$(canonicalize_btrfs_opts_for_compare "${cur_opts}")"
+  wanted="$(canonicalize_btrfs_opts_for_compare "${want_opts_full}")"
 
   [[ "${got}" == "${wanted}" ]] \
     || die "${mp}: mount options mismatch (normalized)
@@ -738,12 +760,23 @@ ensure_mount_operation() {
 
   local cur_fst cur_uid cur_uid_lc
   if findmnt "${mp}" >/dev/null 2>&1; then
+    verify_btrfs_mount_uuid_or_die "${uuid}" "${mp}"
+
+    if btrfs_mount_options_match_p "${mp}" "${opts_full}"; then
+      log "already mounted OK: $(mount_source_spec "${uuid}") -> ${mp}"
+      return 0
+    fi
+
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "dry-run: would remount ${mp} with btrfs options: ${opts_full}"
+      return 0
+    fi
+
+    log "${mp}: remounting to apply desired btrfs options"
+    run mount -o "remount,${opts_full}" "${mp}" \
+      || die "remount failed for ${mp} (check dmesg; for '/' during subvol migration try --relax-root-mount-verify)"
     verify_mount_correct_or_die "${uuid}" "${mp}" "${opts_full}"
-
-    cur_uid_lc="$(lc_uuid "$(findmnt -n -o UUID "${mp}")")"
-    [[ "${cur_uid_lc}" == "${uuid}" ]] || die "internal mismatch verifying ${mp}"
-
-    log "already mounted OK: $(mount_source_spec "${uuid}") -> ${mp}"
+    log "remounted OK: $(mount_source_spec "${uuid}") -> ${mp}"
     return 0
   fi
 
