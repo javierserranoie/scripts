@@ -43,7 +43,8 @@ OS_ACCEPT_NONEMPTY=1
 STRICT_MOUNTPOINT_LAYOUT=0
 NOCOW_VARLOG_CLI=0         # ensure / ensure-subvolumes: apply chattr +C on @var,@log roots
 SKIP_NOCOW_VARLOG_LAYOUT=0 # ensure-os-layout: do not touch CoW (+C vs default behaviour)
-DEFAULT_OS_LAYOUT_RAW='@:/,@home:/home,@var:/var,@log:/var/log'
+DEFAULT_OS_LAYOUT_RAW='@:/,@home:/home,@var:/var,@log:/var/log' # fallback only when findmnt has no subvol=
+DEFAULT_OS_LAYOUT_REST='@home:/home,@var:/var,@log:/var/log'
 LAYOUT_SPEC_RAW=""
 
 UUID="" # lowercase, no UUID= prefix
@@ -162,7 +163,8 @@ Options:
   --skip-bootloader           ensure-full-stack only: btrfs layout + fstab only (no grub.d / initramfs / grub-install)
 
 ensure-os-layout:
-  Defaults --layout to '${DEFAULT_OS_LAYOUT_RAW}' (mount order respects / before /home /var before /var/log).
+  Defaults --layout to live '/' subvol (e.g. @rootfs on Debian) + '${DEFAULT_OS_LAYOUT_REST}' unless you pass --layout
+    (example explicit: '${DEFAULT_OS_LAYOUT_RAW}').
   Reads filesystem UUID from the live root mount /. Use --uuid or --device to override discovery.
   By default applies chattr +C on '@var' and '@log' tops (nocow/new data avoids CoW, better for databases/logs).
   Only names '@var' and '@log' receive +C; customise mount names in --layout → set +C yourself if needed.
@@ -171,8 +173,8 @@ ensure-os-layout:
 ensure-full-stack:
   Requires '/' btrfs, separate '/boot' ext3/ext4 (kernels not on btrfs). If this session booted with UEFI,
   '/boot/efi' must be mounted vfat.
-  Runs the default layout (@, @home, @var, @log), appends btrfs + /boot (+ ESP) fstab lines, writes
-  ${GRUB_SUBVOL_SNIPPET} so GRUB_CMDLINE_LINUX gains rootflags=subvol=@,... from live '/', then
+  Runs the default layout (live '/' subvol + @home, @var, @log), appends btrfs + /boot (+ ESP) fstab lines, writes
+  ${GRUB_SUBVOL_SNIPPET} so GRUB_CMDLINE_LINUX gains rootflags=subvol=<that subvol>,... from live '/', then
   update-initramfs -u -k all, update-grub, and grub-install (EFI vs BIOS detected like detect-boot).
 
 detect-boot:
@@ -337,6 +339,25 @@ discover_live_root_btrfs_uuid_or_die() {
   raw="$(findmnt -n -o UUID / 2>/dev/null || true)"
   [[ -n "${raw}" ]] || die "'/' btrfs mount lacks a UUID (unexpected)"
   lc_uuid "${raw}"
+}
+
+# Subvolume named in subvol= for '/' (Debian installer often @rootfs, not @). No leading slash.
+live_root_btrfs_subvol_from_findmnt_or_at() {
+  local opts sub
+  opts="$(findmnt -n -o OPTIONS / 2>/dev/null || true)"
+  sub="$(printf '%s' "${opts}" | tr ',' '\n' | sed -n 's/^subvol=//p' | head -n1)"
+  sub="${sub#/}"
+  if [[ -z "${sub}" ]]; then
+    printf '%s\n' '@'
+    return 0
+  fi
+  printf '%s\n' "${sub}"
+}
+
+default_os_layout_from_live_root_or_die() {
+  local root_sv
+  root_sv="$(live_root_btrfs_subvol_from_findmnt_or_at)"
+  printf '%s\n' "${root_sv}:/,${DEFAULT_OS_LAYOUT_REST}"
 }
 
 declare -gA _LAYOUT_SUB_BY_MP
@@ -919,7 +940,10 @@ ensure_os_layout_execute_or_die() {
   base_eff="${MOUNT_OPTIONS}"
 
   Lay="${LAYOUT_SPEC_RAW}"
-  [[ -z "${Lay}" ]] && Lay="${DEFAULT_OS_LAYOUT_RAW}"
+  if [[ -z "${Lay}" ]]; then
+    Lay="$(default_os_layout_from_live_root_or_die)"
+    log "default layout: '/' uses live subvolume '$(live_root_btrfs_subvol_from_findmnt_or_at)' (set --layout to override)"
+  fi
 
   parse_layout_into_sorted_arrays_or_die "${Lay}"
   ENSURE_SUBVOLUMES_RAW="$(layout_unique_subvolume_csv)"
@@ -1121,11 +1145,14 @@ write_grub_subvol_snippet_or_die() {
   ensure_grub_d_is_sourced_or_die
   local content
   content='# Managed by btrfs-setup-debian13.sh (ensure-full-stack)
-# Append rootflags=subvol=@,... from live / when not already in GRUB_CMDLINE_LINUX
-if ! echo " ${GRUB_CMDLINE_LINUX} " | grep -qE "(^|[[:space:]])(rootflags=.*subvol=@|subvol=@)(,|$|[[:space:]])"; then
+# Append rootflags=subvol=<live />,... (Debian often @rootfs) when missing from GRUB_CMDLINE_LINUX
+_bt_sv="$(findmnt -n -o OPTIONS / 2>/dev/null | tr "," "\n" | sed -n "s/^subvol=//p" | head -n1)"
+_bt_sv="${_bt_sv#/}"
+[ -z "${_bt_sv}" ] && _bt_sv="@"
+if ! echo " ${GRUB_CMDLINE_LINUX} " | grep -qE "(^|[[:space:]]|,)(subvol=${_bt_sv})(,|$|[[:space:]])"; then
   _bt_rf="$(findmnt -n -o OPTIONS / 2>/dev/null | tr "," "\n" | grep -Ev "^(subvol|subvolid)=" | sed "/^$/d" | paste -sd, -)"
   [ -z "${_bt_rf}" ] && _bt_rf="defaults"
-  GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} rootflags=subvol=@,${_bt_rf}"
+  GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} rootflags=subvol=${_bt_sv},${_bt_rf}"
 fi
 '
   if [[ "${DRY_RUN}" -eq 1 ]]; then
